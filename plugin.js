@@ -8,8 +8,14 @@
 //
 // 注意: 本文件不含任何凭据。IMA OpenAPI 的 client_id/api_key 与浏览器 cookie
 // (IMA-UID/IMA-TOKEN/IMA-REFRESH-TOKEN)一律作为工具调用参数传入,请勿硬编码。
+//
+// 版本: v17
+//  - v14: 知识库列表分页上限 20→400 页(2 万条),修复万页级知识库更新漏匹配
+//  - v15: urls_file 参数,从工作区 JSON 文件读取大 URL 列表分块导入
+//  - v16: 220021(每日列表配额用尽)优雅处理:导入不受影响,列表依赖阶段明确跳过
+//  - v17: skip_builtin_filter 参数,关闭内置过滤以导入标题带扩展名的内容页
 
-// ========== Wiki → IMA 知识库导入通道 (imakb, v13: token expiry auto-refresh on 600001) ==========
+// ========== Wiki → IMA 知识库导入通道 (imakb, v17: skip builtin filter) ==========
 
 function parseUrl(raw) {
   if (typeof raw !== 'string') return null;
@@ -88,14 +94,16 @@ const BUILTIN_EXCLUDE = [
 
 const CJK_NAMESPACE_RE = /(\/|:|title=)(特殊|模板|分类|用户|文件|讨论|帮助|媒体|模块|主题|项目)(:|%3A|\/|$|&)/;
 
-function isExcludedUrl(url, includeRe, excludeRe) {
+function isExcludedUrl(url, includeRe, excludeRe, skipBuiltin) {
   if (includeRe && !includeRe.test(url)) return true;
-  for (let i = 0; i < BUILTIN_EXCLUDE.length; i++) {
-    if (BUILTIN_EXCLUDE[i].test(url)) return true;
+  if (!skipBuiltin) {
+    for (let i = 0; i < BUILTIN_EXCLUDE.length; i++) {
+      if (BUILTIN_EXCLUDE[i].test(url)) return true;
+    }
+    let decoded = null;
+    try { decoded = decodeURIComponent(url); } catch (e) { decoded = null; }
+    if (decoded && decoded !== url && CJK_NAMESPACE_RE.test(decoded)) return true;
   }
-  let decoded = null;
-  try { decoded = decodeURIComponent(url); } catch (e) { decoded = null; }
-  if (decoded && decoded !== url && CJK_NAMESPACE_RE.test(decoded)) return true;
   if (excludeRe && excludeRe.test(url)) return true;
   return false;
 }
@@ -302,10 +310,11 @@ return {
   apply(ctx) {
     const tool = harness.defineTool({
       name: 'wiki_to_ima',
-      description: '把 Wiki 网站页面批量导入或更新到腾讯 IMA 知识库(经 IMA 服务端爬虫,可绕过本机 IP 被目标站点反爬限制的场景)。流程:发现页面(本机可访问时 BFS;被反爬拦截且提供 ima_token 时经 IMA 导入 allpages JSON 回读全站清单;也可直接传 urls 显式列表)→ 分类页过滤 → 每批 10 个 URL 调 import_urls。知识库:传 kb_id 直接使用;或传 kb_name,自动按名字查找已有知识库,没有则自动创建(个人知识库)。文件夹:传 folder_name 自动创建(或复用同名)文件夹并把全部页面导入其中;传 folder_id 直接导入指定文件夹;不传则导入根目录。update=true 时进入更新模式(需 ima_uid/ima_token):对每个 URL 追加无害参数 ima_refresh 破 IMA 服务端 URL 缓存、真正重新抓取;轮询确认新条目在知识库中出现后才删除旧条目(旧条目识别兼容"已解析标题"与"未解析 URL 标题"两种形态,含同标题去重,按文件夹作用域;token 过期自动用 refresh_token 刷新),失败或校验超时则保留旧内容(kept),不丢数据。复查:导入结束后在 review_ms 窗口内轮询核对每个被受理页面的 media_id 是否真正出现在知识库中,缺失的自动换新 URL 参数重导一轮(review_retry),并报告 reviewed/missing。参数:kb_id 与 kb_name 至少传一个(显式 urls 列表模式下 url 可省略);client_id、api_key 必填;folder_id/folder_name 可选;max_pages 默认 100;verify_ms 默认 300000;bust_cache 默认 true;review_ms 默认 180000(设 0 关闭复查);ima_uid/ima_token/ima_refresh_token 可选;include/exclude 为 URL 正则过滤。',
+      description: '把 Wiki 网站页面批量导入或更新到腾讯 IMA 知识库(经 IMA 服务端爬虫,可绕过本机 IP 被目标站点反爬限制的场景)。流程:发现页面(本机可访问时 BFS;被反爬拦截且提供 ima_token 时经 IMA 导入 allpages JSON 回读全站清单;也可直接传 urls 显式列表或 urls_file 文件列表)→ 分类页过滤 → 每批 10 个 URL 调 import_urls。知识库:传 kb_id 直接使用;或传 kb_name,自动按名字查找已有知识库,没有则自动创建(个人知识库)。文件夹:传 folder_name 自动创建(或复用同名)文件夹并把全部页面导入其中;传 folder_id 直接导入指定文件夹;不传则导入根目录。update=true 时进入更新模式(需 ima_uid/ima_token):对每个 URL 追加无害参数 ima_refresh 破 IMA 服务端 URL 缓存、真正重新抓取;轮询确认新条目在知识库中出现后才删除旧条目(旧条目识别兼容"已解析标题"与"未解析 URL 标题"两种形态,含同标题去重,按文件夹作用域;token 过期自动用 refresh_token 刷新),失败或校验超时则保留旧内容(kept),不丢数据。复查:导入结束后在 review_ms 窗口内轮询核对每个被受理页面的 media_id 是否真正出现在知识库中,缺失的自动换新 URL 参数重导一轮(review_retry),并报告 reviewed/missing。遇到 IMA 每日列表读取配额用尽(220021)时明确报告并跳过依赖列表的阶段(导入本身不受影响)。skip_builtin_filter=true 时关闭内置过滤(仅按 include/exclude 过滤),用于导入标题带扩展名等被误过滤的内容页。参数:kb_id 与 kb_name 至少传一个(显式 urls 列表模式下 url 可省略);client_id、api_key 必填;folder_id/folder_name 可选;max_pages 默认 100;verify_ms 默认 300000;bust_cache 默认 true;review_ms 默认 180000(设 0 关闭复查);ima_uid/ima_token/ima_refresh_token 可选;include/exclude 为 URL 正则过滤。',
       parameters: {
-        url: { type: 'string', description: 'Wiki 网站首页(或任意内容页)URL;提供了 urls 列表时可省略' },
+        url: { type: 'string', description: 'Wiki 网站首页(或任意内容页)URL;提供了 urls 列表或 urls_file 时可省略' },
         urls: { type: 'array', items: { type: 'string' }, description: '可选:显式指定要导入/更新的 URL 列表(跳过自动发现)' },
+        urls_file: { type: 'string', description: '可选:从会话工作区内的 JSON 文件读取 URL 列表(文件内容为字符串数组),与 urls 参数合并去重;适合大列表分块导入' },
         kb_id: { type: 'string', description: 'IMA 知识库 ID(knowledge_base_id);与 kb_name 至少传一个,kb_id 优先' },
         kb_name: { type: 'string', description: 'IMA 知识库名称;按名字查找已有知识库,找不到则自动创建同名个人知识库' },
         client_id: { type: 'string', required: true, description: 'IMA OpenAPI Client ID(ima-openapi-clientid)' },
@@ -319,6 +328,7 @@ return {
         bust_cache: { type: 'boolean', description: '更新模式下给 URL 追加 ima_refresh=<时间戳> 无害参数,破 IMA 服务端同 URL 缓存,确保真正重新抓取(默认 true;个别严格路由站点可设 false)' },
         review_ms: { type: 'integer', description: '复查窗口毫秒:导入结束后核对每个页面的条目是否已出现在知识库(默认 180000,每 20 秒轮询;设 0 关闭复查)' },
         review_retry: { type: 'boolean', description: '复查发现缺失时,自动用带新参数的 URL 重导缺失页面一轮(默认 true;更新模式下重导成功还会补删对应旧条目)' },
+        skip_builtin_filter: { type: 'boolean', description: '为 true 时跳过内置 URL 过滤(命名空间/扩展名/登录页等),仅按 include/exclude 正则过滤;用于导入标题带扩展名等被误过滤的内容页' },
         include: { type: 'string', description: '可选:仅导入 URL 匹配该正则的页面' },
         exclude: { type: 'string', description: '可选:跳过 URL 匹配该正则的页面' },
         ima_uid: { type: 'string', description: 'IMA 用户 ID(浏览器 cookie 中的 IMA-UID);更新模式必填' },
@@ -366,9 +376,10 @@ return {
         const signal = exec && exec.signal ? exec.signal : undefined;
         const aborted = () => signal && signal.aborted;
         const hasUrls = Array.isArray(args.urls) && args.urls.length > 0;
+        const hasUrlsFile = typeof args.urls_file === 'string' && args.urls_file.trim().length > 0;
         const rawUrl = typeof args.url === 'string' ? args.url.trim() : '';
         const start = parseUrl(rawUrl);
-        if (!hasUrls && (!start || (start.scheme !== 'http' && start.scheme !== 'https'))) throw new Error('url 必须是完整的 http(s) URL(或提供 urls 列表)');
+        if (!hasUrls && !hasUrlsFile && (!start || (start.scheme !== 'http' && start.scheme !== 'https'))) throw new Error('url 必须是完整的 http(s) URL(或提供 urls 列表 / urls_file)');
         const startUrl = start ? canonicalUrl(start) : '';
         const origin = start ? start.scheme + '://' + start.host : '';
         if (typeof args.client_id !== 'string' || !args.client_id || typeof args.api_key !== 'string' || !args.api_key) {
@@ -376,6 +387,7 @@ return {
         }
         const updateMode = args.update === true;
         const bustCache = args.bust_cache !== false;
+        const skipBuiltin = args.skip_builtin_filter === true;
         const hasTokens = typeof args.ima_token === 'string' && args.ima_token.trim().length > 0;
         if (updateMode && (!hasTokens || typeof args.ima_uid !== 'string' || !args.ima_uid)) {
           throw new Error('更新模式需要 ima_uid 与 ima_token(浏览器 cookie 中的 IMA-UID / IMA-TOKEN),用于删除旧条目');
@@ -415,6 +427,9 @@ return {
 
         const result = { mode: updateMode ? 'update' : 'explicit', discovered: 0, imported: 0, updated: 0, added: 0, kept: 0, failed: 0, deleted_old: 0, reviewed: -1, missing: 0, batches: 0, mediaIds: [], errors: [] };
 
+        const QUOTA_MSG = 'IMA 每日列表读取配额已用尽(220021,明天恢复):导入受理不受影响,但依赖列表的阶段(文件夹定位/更新匹配/校验/复查)暂不可用';
+        function quotaError() { const e = new Error(QUOTA_MSG); e.quota = true; return e; }
+
         // resolve target knowledge base: kb_id > kb_name (search exact name → create if missing)
         let targetKbId = typeof args.kb_id === 'string' ? args.kb_id.trim() : '';
         const kbName = typeof args.kb_name === 'string' ? args.kb_name.trim() : '';
@@ -443,10 +458,11 @@ return {
         async function loadKbEntries(folderId, includeFolders) {
           const entries = [];
           let cursor = '';
-          for (let i = 0; i < 20; i++) {
+          for (let i = 0; i < 400; i++) {
             const payload = { knowledge_base_id: targetKbId, cursor: cursor, limit: 50 };
             if (folderId) payload.folder_id = folderId;
             const r = await imaPost(ctx, 'get_knowledge_list', payload, args.client_id, args.api_key, sessionCwd, standingPolicy, signal);
+            if (r && r.code === 220021) throw quotaError();
             if (!r || r.code !== 0 || !r.data) break;
             const items = r.data.knowledge_list || [];
             for (let j = 0; j < items.length; j++) {
@@ -466,7 +482,13 @@ return {
         let targetFolderId = typeof args.folder_id === 'string' ? args.folder_id.trim() : '';
         const folderName = typeof args.folder_name === 'string' ? args.folder_name.trim() : '';
         if (!targetFolderId && folderName) {
-          const rootEntries = await loadKbEntries('', true);
+          let rootEntries = null;
+          try {
+            rootEntries = await loadKbEntries('', true);
+          } catch (e) {
+            if (e && e.quota) throw new Error(QUOTA_MSG + '(本次请改用 folder_id 参数)' );
+            throw e;
+          }
           let found = '';
           for (let i = 0; i < rootEntries.length; i++) {
             if (rootEntries[i].isFolder && rootEntries[i].title === folderName) { found = rootEntries[i].id; break; }
@@ -492,15 +514,34 @@ return {
         const pushUrl = function (u) {
           if (!u || seen.has(u)) return;
           seen.add(u);
-          if (isExcludedUrl(u, includeRe, excludeRe)) return;
+          if (isExcludedUrl(u, includeRe, excludeRe, skipBuiltin)) return;
           urls.push(u);
         };
+
+        // urls_file: read JSON array from workspace file, merge with urls param
+        if (hasUrlsFile) {
+          let fileText = null;
+          try {
+            const ft = await ctx.fs.resolve(args.urls_file.trim(), sessionCwd ? { cwd: sessionCwd } : {});
+            fileText = await ctx.fs.readText(ft);
+          } catch (e) {
+            throw new Error('读取 urls_file 失败: ' + (e && e.message ? e.message : String(e)));
+          }
+          let arr = null;
+          try { arr = JSON.parse(fileText); } catch (e) { throw new Error('urls_file 不是合法 JSON'); }
+          if (!Array.isArray(arr)) throw new Error('urls_file 内容必须是字符串数组');
+          for (let i = 0; i < arr.length; i++) {
+            if (typeof arr[i] === 'string' && arr[i].trim()) pushUrl(arr[i].trim());
+          }
+        }
 
         if (hasUrls) {
           result.mode = updateMode ? 'update' : 'explicit';
           for (let i = 0; i < args.urls.length; i++) {
             if (typeof args.urls[i] === 'string' && args.urls[i].trim()) pushUrl(args.urls[i].trim());
           }
+        } else if (hasUrlsFile) {
+          result.mode = updateMode ? 'update' : 'explicit-file';
         } else {
           result.mode = updateMode ? 'update-bfs' : 'sandbox';
           let sandboxReachable = false;
@@ -527,7 +568,7 @@ return {
                   const lp = parseUrl(links[i]);
                   if (!lp) continue;
                   if (lp.scheme + '://' + lp.host !== origin) continue;
-                  if (isExcludedUrl(links[i], includeRe, excludeRe)) continue;
+                  if (isExcludedUrl(links[i], includeRe, excludeRe, skipBuiltin)) continue;
                   if (!visited.has(links[i]) && !seen.has(links[i]) && urls.length < maxPages) queue.push(links[i]);
                 }
                 if (delayMs > 0 && !aborted()) await ctx.timeout(delayMs);
@@ -597,10 +638,18 @@ return {
         // update mode: load existing KB entries (folder-scoped) → title map
         const titleToIds = {};
         if (updateMode) {
-          const entries = await loadKbEntries(targetFolderId, false);
-          for (let i = 0; i < entries.length; i++) {
-            if (!titleToIds[entries[i].title]) titleToIds[entries[i].title] = [];
-            titleToIds[entries[i].title].push(entries[i].id);
+          try {
+            const entries = await loadKbEntries(targetFolderId, false);
+            for (let i = 0; i < entries.length; i++) {
+              if (!titleToIds[entries[i].title]) titleToIds[entries[i].title] = [];
+              titleToIds[entries[i].title].push(entries[i].id);
+            }
+          } catch (e) {
+            if (e && e.quota) {
+              result.errors.push(QUOTA_MSG + '(本次更新将按新增处理,可能产生重复条目,建议明天再跑一次 update 整理)');
+            } else {
+              throw e;
+            }
           }
         }
 
@@ -714,8 +763,15 @@ return {
             const deadline = Date.now() + verifyMs;
             const unresolved = new Map();
             for (let i = 0; i < pending.length; i++) unresolved.set(pending[i].mediaId, pending[i].item);
-            while (unresolved.size > 0 && Date.now() < deadline && !aborted()) {
-              const entries = await loadKbEntries(targetFolderId, true);
+            let quotaHit = false;
+            while (unresolved.size > 0 && Date.now() < deadline && !aborted() && !quotaHit) {
+              let entries;
+              try {
+                entries = await loadKbEntries(targetFolderId, true);
+              } catch (e) {
+                if (e && e.quota) { quotaHit = true; break; }
+                throw e;
+              }
               const byId = {};
               for (let i = 0; i < entries.length; i++) byId[entries[i].id] = entries[i].title;
               const current = Array.from(unresolved.entries());
@@ -736,8 +792,12 @@ return {
               }
               if (unresolved.size > 0 && Date.now() < deadline && !aborted()) await ctx.timeout(20000);
             }
-            for (const [mid, item] of unresolved) {
-              if (result.errors.length < 20) result.errors.push('校验超时(新条目未出现,保留旧版): ' + item.url);
+            if (quotaHit) {
+              result.errors.push(QUOTA_MSG + '(校验阶段跳过,旧条目全部保留)');
+            } else {
+              for (const [mid, item] of unresolved) {
+                if (result.errors.length < 20) result.errors.push('校验超时(新条目未出现,保留旧版): ' + item.url);
+              }
             }
           } else {
             for (let i = 0; i < pending.length; i++) {
@@ -793,70 +853,85 @@ return {
             if (toImport[i].ok && toImport[i].newMediaId) expected.push(toImport[i]);
           }
           const visibleIds = new Set();
+          let quotaHit = false;
           const pollReview = async function () {
             const entries = await loadKbEntries(targetFolderId, true);
             for (let i = 0; i < entries.length; i++) visibleIds.add(entries[i].id);
           };
           const deadline = Date.now() + reviewMs;
-          await pollReview();
-          while (expected.some(function (x) { return !visibleIds.has(x.newMediaId); }) && Date.now() < deadline && !aborted()) {
-            await ctx.timeout(20000);
+          try {
             await pollReview();
+          } catch (e) {
+            if (e && e.quota) { quotaHit = true; } else { throw e; }
           }
-          let missing = expected.filter(function (x) { return !visibleIds.has(x.newMediaId); });
-          if (missing.length > 0 && reviewRetry && !aborted()) {
-            const now2 = Math.floor(Date.now() / 1000);
-            for (let i = 0; i < missing.length; i++) {
-              const m = missing[i];
-              m.importUrl = m.url + (m.url.indexOf('?') === -1 ? '?' : '&') + 'ima_review=' + (now2 + i);
-            }
-            await importAll(missing, true);
-            const rDeadline = Date.now() + Math.min(reviewMs, 180000);
-            while (missing.some(function (x) { return !x.ok || !visibleIds.has(x.newMediaId); }) && Date.now() < rDeadline && !aborted()) {
-              await ctx.timeout(20000);
+          while (!quotaHit && expected.some(function (x) { return !visibleIds.has(x.newMediaId); }) && Date.now() < deadline && !aborted()) {
+            await ctx.timeout(20000);
+            try {
               await pollReview();
+            } catch (e) {
+              if (e && e.quota) { quotaHit = true; break; }
+              throw e;
             }
-            // update mode: for retry items now visible, delete their kept old entries
-            if (updateMode) {
-              const delIds2 = [];
-              const delSeen2 = new Set();
-              const retryDel = [];
+          }
+          if (quotaHit) {
+            result.errors.push(QUOTA_MSG + '(复查阶段跳过)');
+            result.reviewed = -2;
+          } else {
+            let missing = expected.filter(function (x) { return !visibleIds.has(x.newMediaId); });
+            if (missing.length > 0 && reviewRetry && !aborted()) {
+              const now2 = Math.floor(Date.now() / 1000);
               for (let i = 0; i < missing.length; i++) {
                 const m = missing[i];
-                if (m.ok && visibleIds.has(m.newMediaId)) {
-                  retryDel.push(m);
-                  for (let j = 0; j < m.oldIds.length; j++) {
-                    const oid = m.oldIds[j];
-                    if (!delSeen2.has(oid)) { delSeen2.add(oid); delIds2.push(oid); }
+                m.importUrl = m.url + (m.url.indexOf('?') === -1 ? '?' : '&') + 'ima_review=' + (now2 + i);
+              }
+              await importAll(missing, true);
+              const rDeadline = Date.now() + Math.min(reviewMs, 180000);
+              while (missing.some(function (x) { return !x.ok || !visibleIds.has(x.newMediaId); }) && Date.now() < rDeadline && !aborted()) {
+                await ctx.timeout(20000);
+                await pollReview();
+              }
+              // update mode: for retry items now visible, delete their kept old entries
+              if (updateMode) {
+                const delIds2 = [];
+                const delSeen2 = new Set();
+                const retryDel = [];
+                for (let i = 0; i < missing.length; i++) {
+                  const m = missing[i];
+                  if (m.ok && visibleIds.has(m.newMediaId)) {
+                    retryDel.push(m);
+                    for (let j = 0; j < m.oldIds.length; j++) {
+                      const oid = m.oldIds[j];
+                      if (!delSeen2.has(oid)) { delSeen2.add(oid); delIds2.push(oid); }
+                    }
+                  }
+                }
+                for (let i = 0; i < delIds2.length; i += 10) {
+                  if (aborted()) break;
+                  const chunk = delIds2.slice(i, i + 10);
+                  const del = await cgiDelKnowledge(ctx, chunk, args.ima_uid, args.ima_token, args.ima_refresh_token || '', sessionCwd, standingPolicy, signal);
+                  if (del && del.code === 0) {
+                    const results = del.results || (del.data && del.data.results) || {};
+                    for (let j = 0; j < chunk.length; j++) {
+                      const r = results[chunk[j]];
+                      if (r && r.ret_code === 0) result.deleted_old += 1;
+                    }
+                  }
+                  await ctx.timeout(500);
+                }
+                for (let i = 0; i < retryDel.length; i++) {
+                  if (retryDel[i].oldIds.length > 0) {
+                    result.updated += 1;
+                    if (result.kept > 0) result.kept -= 1;
                   }
                 }
               }
-              for (let i = 0; i < delIds2.length; i += 10) {
-                if (aborted()) break;
-                const chunk = delIds2.slice(i, i + 10);
-                const del = await cgiDelKnowledge(ctx, chunk, args.ima_uid, args.ima_token, args.ima_refresh_token || '', sessionCwd, standingPolicy, signal);
-                if (del && del.code === 0) {
-                  const results = del.results || (del.data && del.data.results) || {};
-                  for (let j = 0; j < chunk.length; j++) {
-                    const r = results[chunk[j]];
-                    if (r && r.ret_code === 0) result.deleted_old += 1;
-                  }
-                }
-                await ctx.timeout(500);
-              }
-              for (let i = 0; i < retryDel.length; i++) {
-                if (retryDel[i].oldIds.length > 0) {
-                  result.updated += 1;
-                  if (result.kept > 0) result.kept -= 1;
-                }
-              }
+              missing = missing.filter(function (x) { return !x.ok || !visibleIds.has(x.newMediaId); });
             }
-            missing = missing.filter(function (x) { return !x.ok || !visibleIds.has(x.newMediaId); });
-          }
-          result.reviewed = expected.length - missing.length;
-          result.missing = missing.length;
-          for (let i = 0; i < missing.length; i++) {
-            if (result.errors.length < 20) result.errors.push('复查缺失: ' + missing[i].url);
+            result.reviewed = expected.length - missing.length;
+            result.missing = missing.length;
+            for (let i = 0; i < missing.length; i++) {
+              if (result.errors.length < 20) result.errors.push('复查缺失: ' + missing[i].url);
+            }
           }
         }
 
