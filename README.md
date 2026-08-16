@@ -1,5 +1,7 @@
 # wiki_to_ima — Wiki 网站 → 腾讯 IMA 知识库
 
+> 当前版本 **v17**(2026-08):v14 万页级知识库列表上限修复 · v15 `urls_file` 分块导入 · v16 每日列表配额(220021)优雅处理 · v17 `skip_builtin_filter` 逃生门。实测战绩:CK3 Wiki 382 页、明日方舟 Wiki **15,541 页**全量入库。
+
 DSH 动态 Cordis 插件(Host 半部),注册工具 `wiki_to_ima`:把任意 Wiki 网站的全部页面批量导入或更新到腾讯 IMA 知识库。
 
 核心思路:**页面发现在本机,内容抓取在 IMA 服务端** —— `import_urls` 由 IMA 服务器去抓取网页并解析入库,因此即使本机 IP 被目标站点反爬拦截(如 Cloudflare),导入通道依然可用。
