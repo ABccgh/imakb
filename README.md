@@ -1,6 +1,6 @@
 # wiki_to_ima — Wiki 网站 → 腾讯 IMA 知识库
 
-> 当前版本 **v18**(2026-08):v14 万页级知识库列表上限修复 · v15 `urls_file` 分块导入 · v16 每日列表配额(220021)优雅处理 · v17 `skip_builtin_filter` 逃生门 · v18 `clear_kb` 整库/文件夹替换模式 + `api_host`/`page_url_pattern`(主域名被 WAF 拦截的 wiki,如 prts.wiki 经 m.prts.wiki 发现)。实测战绩:CK3 Wiki 382 页、明日方舟 Wiki(biligame) **15,541 页**全量入库;prts.wiki **18,500 页**整库替换完成。
+> 当前版本 **v20**(2026-08):v14 万页级知识库列表上限修复 · v15 `urls_file` 分块导入 · v16 每日列表配额(220021)优雅处理 · v17 `skip_builtin_filter` 逃生门 · v18 `clear_kb` 整库/文件夹替换模式 + `api_host`/`page_url_pattern`(主域名被 WAF 拦截的 wiki,如 prts.wiki 经 m.prts.wiki 发现)· v19 工具注册冲突自愈(宿主进程已有损坏的 `wiki_to_ima` 注册时自动降级注册 `wiki_to_ima2`)+ 发现回读失败降级不中断 · **v20 `fix_unparsed`(更新模式默认开启,未解析标题自动重导修复)+ `dedup_titles`(同名条目去重),实测把 CK3 Wiki 全量替换后残留的 131 条未解析标题修复归零**。实测战绩:CK3 Wiki 382 页首轮入库、384 页全量刷新更新;明日方舟 Wiki(biligame) **15,541 页**全量入库;prts.wiki **18,500 页**整库替换完成。
 
 DSH 动态 Cordis 插件(Host 半部),注册工具 `wiki_to_ima`:把任意 Wiki 网站的全部页面批量导入或更新到腾讯 IMA 知识库。
 
@@ -19,6 +19,8 @@ DSH 动态 Cordis 插件(Host 半部),注册工具 `wiki_to_ima`:把任意 Wiki 
 - **整库替换** (`clear_kb: true`,需浏览器 cookie):导入前把目标范围(folder_id 或根目录)内的全部现有条目枚举后经 cgi `del_knowledge` 分批删除,再导入新内容;单独传 `clear_kb` 不传 url 时仅清空不导入
 - **WAF 分流发现** (`api_host`):页面发现时改用别的子域上的 MediaWiki API(如 prts.wiki 主域 403,而 `m.prts.wiki/api.php` 正常);`page_url_pattern` 控制由标题构造页面 URL 的模板(短链接站点用 `w/{title}`,标题内 `/` 自动保留为子页面分隔符)
 - **复查** (`review_ms`):导入结束后核对每个被受理页面的 `media_id` 是否真正入库,缺失的自动换新 URL 参数重导一轮(`review_retry`),报告 `reviewed`/`missing`
+- **未解析标题修复** (`fix_unparsed`,更新模式默认开启,v20):复查后对"标题仍为原始 URL(未解析)"的条目自动换新参数重导,已解析副本出现后删除未解析条目(按基础 URL 折叠,每页只保留一条,最多 `fix_unparsed_rounds` 轮);报告 `fixed_unparsed`/`unparsed`
+- **同名去重** (`dedup_titles`,更新模式默认开启,v20):最终列出目标范围,删除同名(已解析)条目的多余副本,仅保留一条;报告 `deduped`
 
 ## 加载到 DSH
 
@@ -49,6 +51,9 @@ DSH 动态 Cordis 插件(Host 半部),注册工具 `wiki_to_ima`:把任意 Wiki 
 | `api_host` | 可选 | 发现阶段使用的 MediaWiki API 主机(如 `m.prts.wiki`),默认起始 URL 主机 |
 | `page_url_pattern` | 可选 | 标题→页面 URL 模板,`{title}` 为分段编码标题(标题内 / 保留),默认 `index.php?title={title}`;prts.wiki 用 `w/{title}` |
 | `ima_uid` / `ima_token` / `ima_refresh_token` | 更新模式必填 | 浏览器 cookie(IMA-UID / IMA-TOKEN / IMA-REFRESH-TOKEN) |
+| `fix_unparsed` | 可选 | 更新模式下自动重导"标题仍为 URL(未解析)"的条目并删除未解析旧条目,默认 true |
+| `fix_unparsed_rounds` | 可选 | fix_unparsed 重导轮数上限,默认 2(1-5) |
+| `dedup_titles` | 可选 | 更新模式下删除同名已解析条目的多余副本,仅保留一条,默认 true |
 
 > ⚠️ 安全:所有凭据一律作为调用参数传入,本插件不保存、不硬编码任何凭据。
 
@@ -114,15 +119,21 @@ wiki_to_ima({
 
 ## 输出
 
-`mode`、`kb_id`、`created_kb`、`discovered`、`imported`、`updated`、`added`、`kept`、`failed`、`deleted_old`、`reviewed`、`missing`、`folder_id`、`batches`、`mediaIds`、`errors`。
+`mode`、`kb_id`、`created_kb`、`discovered`、`imported`、`updated`、`added`、`kept`、`failed`、`deleted_old`、`reviewed`、`missing`、`unparsed`、`fixed_unparsed`、`deduped`、`folder_id`、`batches`、`mediaIds`、`errors`。
 
 ## 实战记录:CK3 Wiki
 
-`https://ck3.paradoxwikis.com/`(Cloudflare 防护)经此插件完整入库:
+`https://ck3.paradoxwikis.com/`(Cloudflare 防护)经此插件完整入库与更新:
 
 - 全站 allpages 425 页 → 过滤 43 个消歧义/项目/模板/导航页 → **382 个内容页**
 - 首轮导入 382/382 成功,零失败;复查 3/3
 - 更新模式实测:token 过期自动刷新后成功删除 9 个积压重复条目,重复归零
+- **v19 全量刷新实录(2026-08-17)**:本机被 Cloudflare 黑洞化后,开 VPN 仍遇交互式挑战;改用本机 Edge `--remote-debugging-port` + CDP 让真实浏览器自动通过挑战,本地直取 api.php allpages(425 页,与旧清单 0 差异;同时回收 2 个此前被误过滤的内容页 Ritsuryō、Sōryō)→ 384 页带 `ima_refresh` 重导入 → 校验新条目全部可见后 cgi `del_knowledge` 删旧(先导入后删旧,不丢数据)。注意:cgi `knowledge/get_knowledge` 对 `weburl_*` 媒体 ID 现返回 500010,IMA-discovery 的 allpages 回读不可用,本地发现(CDP 浏览器)是当前最可靠路径;发现阶段导入的 api.php 条目会落在知识库根目录,更新完成后需随手删除。
+- **v20 全面替换实录(2026-08-18)**:allpages 与昨日 0 差异(425 页),**416 个内容页**(排除 9 个工具页)带 `ima_refresh` 全量重导入(416/416 受理、零失败)→ 校验全部可见后删除旧条目 416 条与根目录残留 → 实测踩到两个新问题并已修复:
+  - **IMA 解析延迟是小时级**:导入后 5–10 分钟内 90%+ 条目标题仍是 URL 形态,`fix_unparsed` 过早运行几乎修不动(v20.1 已改为"等到出现已解析标题才删除旧条目",轮询窗口改用 `verify_ms`);正确姿势:先跑 `update` 完成替换,**解析沉淀数小时后再跑一次 `update`**(自带 fix_unparsed,幂等)收尾
+  - **空标题(解析中)条目绝不可参与同名去重**:外置驱动脚本曾把 51 条空标题当成重复组误删 50 条(43 页缺失),已用 `ima_missing` 补导找回;插件 `loadKbEntries` 天然跳过空标题,不受影响
+  - 替换后调度了 2.5 小时延迟收尾 pass(重导未解析页、补导缺失页、去重),结果见 `ck3-fix-later-report.json`
+- **v20.1 计数问题实录(2026-08-18 晚)**:App 显示知识库"2065 个文件",实际文件夹列表只有 424 条 —— 根因:**IMA 的 `del_knowledge` 是软删除**,被删条目不再出现在列表,但仍计入 `knowledge_total_size` / 文件夹 `file_number`(后台无回收站、无清除 API,计数只增不减;对照:无删除历史的"明日方舟 Wiki"计数 18500 与实际完全一致)。文件夹本身也无法经 API 删除(`del_knowledge` 对 folder 返回 600000)。解法:**删除整个知识库重建** —— cgi `knowledge_tab_writer/delete_knowledge_base`,payload `{id: <web kb id>}`(code 0)→ OpenAPI `create_knowledge_base` 重建同名库(新 kb_id `g_efc0…`,web id `7495452492569984`)→ `create_folder` 重建 "CK3 Wiki"(`folder_7495452538703464`)→ 416 页重导入(零失败)→ 新库计数 **416** 归零。代价:kb_id/folder_id 变更 + 解析从零开始(小时级),因此只在计数问题必须清零时才重建
 
 ## 实战记录:明日方舟 Wiki(1.5 万页级)
 
@@ -149,4 +160,6 @@ wiki_to_ima({
 - `220001` URL 导入失败(重定向页或服务端抓取失败;同 URL 短窗口内重复导入也会触发)→ 更新模式会保留旧内容
 - `222001` 知识库已删除(如提示建文件夹失败,先到 IMA 回收站恢复或新建知识库)
 - `600001/600002` 登录过期 → 自动用 refresh_token 刷新后重试
-- IMA 服务端解析是异步的:新条目可能在导入后数分钟才在列表中可见,未解析时条目标题为原始 URL(插件已兼容)
+- `600000` 文件夹不可经 cgi `del_knowledge` 删除(文件夹实体受保护)
+- ⚠️ `del_knowledge` 为**软删除**:条目从列表消失但继续计入知识库 `knowledge_total_size` 计数,无回收站/清除 API,计数只增不减;要彻底清零只能删除整个知识库重建(见 CK3 v20.1 实录;重建会改变 kb_id 且解析重新开始)
+- IMA 服务端解析是异步的:新条目可能在导入后数分钟才在列表中可见,未解析时条目标题为原始 URL(插件已兼容);**解析完成是小时级**,替换导入后应隔数小时再跑一次 `update` 收尾
