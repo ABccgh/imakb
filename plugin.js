@@ -9,15 +9,31 @@
 // 注意: 本文件不含任何凭据。IMA OpenAPI 的 client_id/api_key 与浏览器 cookie
 // (IMA-UID/IMA-TOKEN/IMA-REFRESH-TOKEN)一律作为工具调用参数传入,请勿硬编码。
 //
-// 版本: v18
+// 版本: v20
 //  - v14: 知识库列表分页上限 20→400 页(2 万条),修复万页级知识库更新漏匹配
 //  - v15: urls_file 参数,从工作区 JSON 文件读取大 URL 列表分块导入
 //  - v16: 220021(每日列表配额用尽)优雅处理:导入不受影响,列表依赖阶段明确跳过
 //  - v17: skip_builtin_filter 参数,关闭内置过滤以导入标题带扩展名的内容页
 //  - v18: clear_kb 清空模式(整库/文件夹替换,需 cookie);api_host + page_url_pattern
 //         支持主域名被 WAF 拦截、API 挂别的子域的站点(如 prts.wiki ↔ m.prts.wiki)
+//  - v19: 工具注册冲突自愈——宿主进程中若已有(可能损坏的)wiki_to_ima 注册,
+//         自动降级注册 wiki_to_ima2;同时给 IMA-discovery 回读(cgi get_knowledge)
+//         增加失败降级:回读不到 allpages JSON 时不再中断,改用起始 URL 单页导入
+//         并明确报错提示改用本地发现(CDP 浏览器)或 urls_file。
+//  - v20: 更新模式新增 fix_unparsed(默认 true)——复查后对"标题仍为原始 URL(未解析)"
+//         的条目自动换新参数重导,出现已解析副本后删除未解析条目(按基础 URL 折叠,
+//         每页只保留一条,最多 fix_unparsed_rounds 轮);新增 dedup_titles(默认 true)
+//         ——最终列出目标范围,删除同名已解析条目的多余副本,仅保留一条;输出新增
+//         unparsed / fixed_unparsed / deduped 计数。
+//  - v20.1(同日热修):fix_unparsed 轮询改为"等到出现已解析标题才算修复",不再把
+//         刚出现但仍为 URL 标题的副本提前移出待修复集合(避免空转一轮即放弃);
+//         轮询窗口改用 verify_ms(最长 15 分钟)。教训:CK3 实测 IMA 解析延迟为
+//         小时级,替换导入后数小时内 fix_unparsed 能修复的数量有限,应在解析沉淀
+//         数小时后再跑一次 update(自带 fix_unparsed)收尾,工具幂等可重复调用;
+//         另注意同名去重必须跳过"空标题(解析中)"条目,否则整批空标题会被当成
+//         重复组误删(插件 loadKbEntries 天然跳过空标题,不受影响)。
 
-// ========== Wiki → IMA 知识库导入通道 (imakb, v18: clear_kb replace mode) ==========
+// ========== Wiki → IMA 知识库导入通道 (imakb, v20: fix_unparsed + dedup_titles) ==========
 
 function parseUrl(raw) {
   if (typeof raw !== 'string') return null;
@@ -327,7 +343,7 @@ return {
   apply(ctx) {
     const tool = harness.defineTool({
       name: 'wiki_to_ima',
-      description: '把 Wiki 网站页面批量导入或更新到腾讯 IMA 知识库(经 IMA 服务端爬虫,可绕过本机 IP 被目标站点反爬限制的场景)。流程:发现页面(本机可访问时 BFS;被反爬拦截且提供 ima_token 时经 IMA 导入 allpages JSON 回读全站清单;也可直接传 urls 显式列表或 urls_file 文件列表)→ 分类页过滤 → 每批 10 个 URL 调 import_urls。知识库:传 kb_id 直接使用;或传 kb_name,自动按名字查找已有知识库,没有则自动创建(个人知识库)。文件夹:传 folder_name 自动创建(或复用同名)文件夹并把全部页面导入其中;传 folder_id 直接导入指定文件夹;不传则导入根目录。update=true 时进入更新模式(需 ima_uid/ima_token):对每个 URL 追加无害参数 ima_refresh 破 IMA 服务端 URL 缓存、真正重新抓取;轮询确认新条目在知识库中出现后才删除旧条目(旧条目识别兼容"已解析标题"与"未解析 URL 标题"两种形态,含同标题去重,按文件夹作用域;token 过期自动用 refresh_token 刷新),失败或校验超时则保留旧内容(kept),不丢数据。复查:导入结束后在 review_ms 窗口内轮询核对每个被受理页面的 media_id 是否真正出现在知识库中,缺失的自动换新 URL 参数重导一轮(review_retry),并报告 reviewed/missing。遇到 IMA 每日列表读取配额用尽(220021)时明确报告并跳过依赖列表的阶段(导入本身不受影响)。skip_builtin_filter=true 时关闭内置过滤(仅按 include/exclude 过滤),用于导入标题带扩展名等被误过滤的内容页。clear_kb=true 时在导入前清空目标范围(folder_id 或根目录,不含子文件夹)内的全部现有条目(需 ima_uid/ima_token,经 cgi del_knowledge 每批 10 个删除),实现整库/文件夹替换;单独传 clear_kb 而不传 url/urls/urls_file 时仅清空不导入。api_host 可选:页面发现(IMA 回读 allpages)时使用的 MediaWiki API 主机(如 m.prts.wiki),默认用起始 URL 主机,用于主域名被 WAF 拦截、API 挂在其他子域的站点。page_url_pattern 可选:由 allpages 标题构造页面 URL 的模板,{title} 被替换为分段编码后的标题(标题内 / 保留),默认 index.php?title={title};短链接站点如 prts.wiki 用 w/{title}。参数:kb_id 与 kb_name 至少传一个(显式 urls 列表模式下 url 可省略);client_id、api_key 必填;folder_id/folder_name 可选;max_pages 默认 100;verify_ms 默认 300000;bust_cache 默认 true;review_ms 默认 180000(设 0 关闭复查);ima_uid/ima_token/ima_refresh_token 可选;include/exclude 为 URL 正则过滤。',
+      description: '把 Wiki 网站页面批量导入或更新到腾讯 IMA 知识库(经 IMA 服务端爬虫,可绕过本机 IP 被目标站点反爬限制的场景)。流程:发现页面(本机可访问时 BFS;被反爬拦截且提供 ima_token 时经 IMA 导入 allpages JSON 回读全站清单;也可直接传 urls 显式列表或 urls_file 文件列表)→ 分类页过滤 → 每批 10 个 URL 调 import_urls。知识库:传 kb_id 直接使用;或传 kb_name,自动按名字查找已有知识库,没有则自动创建(个人知识库)。文件夹:传 folder_name 自动创建(或复用同名)文件夹并把全部页面导入其中;传 folder_id 直接导入指定文件夹;不传则导入根目录。update=true 时进入更新模式(需 ima_uid/ima_token):对每个 URL 追加无害参数 ima_refresh 破 IMA 服务端 URL 缓存、真正重新抓取;轮询确认新条目在知识库中出现后才删除旧条目(旧条目识别兼容"已解析标题"与"未解析 URL 标题"两种形态,含同标题去重,按文件夹作用域;token 过期自动用 refresh_token 刷新),失败或校验超时则保留旧内容(kept),不丢数据。复查:导入结束后在 review_ms 窗口内轮询核对每个被受理页面的 media_id 是否真正出现在知识库中,缺失的自动换新 URL 参数重导一轮(review_retry),并报告 reviewed/missing。遇到 IMA 每日列表读取配额用尽(220021)时明确报告并跳过依赖列表的阶段(导入本身不受影响)。skip_builtin_filter=true 时关闭内置过滤(仅按 include/exclude 过滤),用于导入标题带扩展名等被误过滤的内容页。clear_kb=true 时在导入前清空目标范围(folder_id 或根目录,不含子文件夹)内的全部现有条目(需 ima_uid/ima_token,经 cgi del_knowledge 每批 10 个删除),实现整库/文件夹替换;单独传 clear_kb 而不传 url/urls/urls_file 时仅清空不导入。api_host 可选:页面发现(IMA 回读 allpages)时使用的 MediaWiki API 主机(如 m.prts.wiki),默认用起始 URL 主机,用于主域名被 WAF 拦截、API 挂在其他子域的站点。page_url_pattern 可选:由 allpages 标题构造页面 URL 的模板,{title} 被替换为分段编码后的标题(标题内 / 保留),默认 index.php?title={title};短链接站点如 prts.wiki 用 w/{title}。v20 起更新模式默认 fix_unparsed=true:复查结束后对"标题仍为原始 URL(未解析)"的条目自动换新参数重导,已解析副本出现后删除未解析条目(每页只保留一条,最多 fix_unparsed_rounds 轮);dedup_titles=true:最终删除同名已解析条目的多余副本,仅保留一条。参数:kb_id 与 kb_name 至少传一个(显式 urls 列表模式下 url 可省略);client_id、api_key 必填;folder_id/folder_name 可选;max_pages 默认 100;verify_ms 默认 300000;bust_cache 默认 true;review_ms 默认 180000(设 0 关闭复查);ima_uid/ima_token/ima_refresh_token 可选;include/exclude 为 URL 正则过滤。',
       parameters: {
         url: { type: 'string', description: 'Wiki 网站首页(或任意内容页)URL;提供了 urls 列表或 urls_file 时可省略' },
         urls: { type: 'array', items: { type: 'string' }, description: '可选:显式指定要导入/更新的 URL 列表(跳过自动发现)' },
@@ -353,7 +369,10 @@ return {
         exclude: { type: 'string', description: '可选:跳过 URL 匹配该正则的页面' },
         ima_uid: { type: 'string', description: 'IMA 用户 ID(浏览器 cookie 中的 IMA-UID);更新模式必填' },
         ima_token: { type: 'string', description: 'IMA 会话 token(浏览器 cookie 中的 IMA-TOKEN);更新模式必填,过期会自动用 ima_refresh_token 刷新' },
-        ima_refresh_token: { type: 'string', description: 'IMA 刷新 token(浏览器 cookie 中的 IMA-REFRESH-TOKEN),token 过期时自动刷新' }
+        ima_refresh_token: { type: 'string', description: 'IMA 刷新 token(浏览器 cookie 中的 IMA-REFRESH-TOKEN),token 过期时自动刷新' },
+        fix_unparsed: { type: 'boolean', description: '更新模式下,复查结束后自动重导"标题仍为原始 URL(未解析)"的条目(换新缓存参数),等到已解析副本出现后删除未解析条目,最多 fix_unparsed_rounds 轮(默认 true);IMA 解析为小时级延迟,建议解析沉淀数小时后再跑一次 update 收尾(幂等)' },
+        fix_unparsed_rounds: { type: 'integer', description: 'fix_unparsed 重导轮数上限(默认 2,范围 1-5)' },
+        dedup_titles: { type: 'boolean', description: '更新模式下,最终列出目标范围并删除同名(已解析)条目的多余副本,仅保留一条(默认 true)' }
       },
       output: {
         schema: {
@@ -373,6 +392,9 @@ return {
             cleared: { type: 'integer', required: true },
             reviewed: { type: 'integer', required: true },
             missing: { type: 'integer', required: true },
+            unparsed: { type: 'integer' },
+            fixed_unparsed: { type: 'integer' },
+            deduped: { type: 'integer' },
             folder_id: { type: 'string' },
             batches: { type: 'integer', required: true },
             mediaIds: { type: 'array', items: { type: 'string' } },
@@ -388,6 +410,9 @@ return {
           lines.push('- 发现页面: ' + value.discovered + ',成功导入: ' + value.imported + '(新增 ' + value.added + ',更新 ' + value.updated + ',保留旧版 ' + value.kept + '),失败: ' + value.failed);
           if (value.folder_id) lines.push('- 目标文件夹: ' + value.folder_id);
           if (value.reviewed >= 0) lines.push('- 复查: 已入库 ' + value.reviewed + ' / ' + value.imported + ',缺失 ' + value.missing);
+          if (value.fixed_unparsed > 0) lines.push('- 修复未解析标题: ' + value.fixed_unparsed + ' 条(重导后删除未解析条目)');
+          if (value.unparsed > 0) lines.push('- 仍未解析(标题为 URL): ' + value.unparsed + ' 条');
+          if (value.deduped > 0) lines.push('- 同名条目去重: 删除 ' + value.deduped + ' 条');
           lines.push('- 删除旧条目: ' + value.deleted_old + ' 个;import_urls 批次: ' + value.batches + ' 批(每批最多 10 个 URL)');
           if (value.errors && value.errors.length) lines.push('- 错误: ' + value.errors.join('; '));
           return [{ type: 'text', text: lines.join('\n') }];
@@ -465,7 +490,7 @@ return {
             : undefined;
         } catch (e) { standingPolicy = undefined; }
 
-        const result = { mode: updateMode ? 'update' : 'explicit', discovered: 0, imported: 0, updated: 0, added: 0, kept: 0, failed: 0, deleted_old: 0, cleared: 0, reviewed: -1, missing: 0, batches: 0, mediaIds: [], errors: [] };
+        const result = { mode: updateMode ? 'update' : 'explicit', discovered: 0, imported: 0, updated: 0, added: 0, kept: 0, failed: 0, deleted_old: 0, cleared: 0, reviewed: -1, missing: 0, unparsed: 0, fixed_unparsed: 0, deduped: 0, batches: 0, mediaIds: [], errors: [] };
 
         const QUOTA_MSG = 'IMA 每日列表读取配额已用尽(220021,明天恢复):导入受理不受影响,但依赖列表的阶段(文件夹定位/更新匹配/校验/复查)暂不可用';
         function quotaError() { const e = new Error(QUOTA_MSG); e.quota = true; return e; }
@@ -1008,11 +1033,142 @@ return {
           }
         }
 
+        // ===== v20: fix unparsed entries (URL-form titles) + dedup duplicate parsed titles =====
+        const doFixUnparsed = updateMode && args.fix_unparsed !== false;
+        const doDedup = updateMode && args.dedup_titles !== false;
+        if (doFixUnparsed || doDedup) {
+          let fixRounds = args.fix_unparsed_rounds === undefined ? 2 : Number(args.fix_unparsed_rounds);
+          if (!Number.isFinite(fixRounds)) fixRounds = 2;
+          fixRounds = Math.max(1, Math.min(5, Math.floor(fixRounds)));
+          let quotaHit = false;
+          const listing = async function () {
+            try { return await loadKbEntries(targetFolderId, true); }
+            catch (e) { if (e && e.quota) { quotaHit = true; return []; } throw e; }
+          };
+          const baseOfUrlTitle = function (t) {
+            let s = String(t || '');
+            s = s.replace(/[?&]ima_(refresh|retry|review|fix)=\d+/g, '');
+            const q = s.indexOf('?ima_');
+            if (q !== -1) s = s.slice(0, q);
+            return s;
+          };
+          let entries = await listing();
+          if (quotaHit) {
+            result.errors.push(QUOTA_MSG + '(未解析修复/去重阶段跳过)');
+          } else {
+            const delBatch = async function (ids) {
+              for (let i = 0; i < ids.length; i += 10) {
+                if (aborted()) break;
+                const chunk = ids.slice(i, i + 10);
+                const del = await cgiDelKnowledge(ctx, chunk, args.ima_uid, args.ima_token, args.ima_refresh_token || '', sessionCwd, standingPolicy, signal);
+                if (del && del.code === 0) {
+                  const results = del.results || (del.data && del.data.results) || {};
+                  for (let j = 0; j < chunk.length; j++) {
+                    const r = results[chunk[j]];
+                    if (r && r.ret_code === 0) result.deleted_old += 1;
+                  }
+                }
+                await ctx.timeout(500);
+              }
+            };
+            let unfixed = entries.filter(function (e) { return !e.isFolder && /^https?:\/\//i.test(e.title) && e.title.indexOf('/api.php') === -1; });
+            if (doFixUnparsed) {
+              for (let round = 0; round <= fixRounds && !aborted(); round++) {
+                // collapse URL-form duplicates: one entry per base URL
+                const byBase = {};
+                const extraIds = [];
+                for (let i = 0; i < unfixed.length; i++) {
+                  const base = baseOfUrlTitle(unfixed[i].title);
+                  if (!byBase[base]) byBase[base] = unfixed[i];
+                  else extraIds.push(unfixed[i].id);
+                }
+                if (extraIds.length > 0) {
+                  await delBatch(extraIds);
+                  entries = await listing();
+                  if (quotaHit) break;
+                }
+                unfixed = entries.filter(function (e) { return !e.isFolder && /^https?:\/\//i.test(e.title) && e.title.indexOf('/api.php') === -1; });
+                if (round === fixRounds || unfixed.length === 0) break;
+                // re-import one fresh copy per unparsed page
+                const items = [];
+                for (let i = 0; i < unfixed.length; i++) {
+                  items.push({ url: baseOfUrlTitle(unfixed[i].title), importUrl: '', oldIds: [unfixed[i].id], ok: false, newMediaId: '' });
+                }
+                const nowFix = Math.floor(Date.now() / 1000);
+                for (let i = 0; i < items.length; i++) {
+                  items[i].importUrl = items[i].url + (items[i].url.indexOf('?') === -1 ? '?' : '&') + 'ima_fix=' + (nowFix + i);
+                }
+                await importAll(items, true);
+                const deadline = Date.now() + (verifyMs > 0 ? Math.min(verifyMs, 900000) : 300000);
+                const unresolved = new Map();
+                for (let i = 0; i < items.length; i++) {
+                  if (items[i].ok && items[i].newMediaId) unresolved.set(items[i].newMediaId, items[i]);
+                }
+                while (unresolved.size > 0 && Date.now() < deadline && !aborted()) {
+                  await ctx.timeout(20000);
+                  const cur = await listing();
+                  if (quotaHit) break;
+                  const byId = {};
+                  for (let i = 0; i < cur.length; i++) byId[cur[i].id] = cur[i].title;
+                  for (const mid of Array.from(unresolved.keys())) {
+                    const t = byId[mid];
+                    if (t === undefined) continue; // not materialized yet
+                    if (/^https?:\/\//i.test(t)) continue; // v20.1: still unparsed → keep waiting until deadline
+                    const item = unresolved.get(mid);
+                    unresolved.delete(mid);
+                    if (item) {
+                      await delBatch(item.oldIds);
+                      result.fixed_unparsed += item.oldIds.length;
+                    }
+                  }
+                }
+                entries = await listing();
+                if (quotaHit) break;
+              }
+            }
+            entries = await listing();
+            result.unparsed = quotaHit ? -2 : entries.filter(function (e) { return !e.isFolder && /^https?:\/\//i.test(e.title); }).length;
+            // dedup: delete extra copies of duplicate parsed titles
+            if (doDedup && !quotaHit) {
+              const byTitle = {};
+              for (let i = 0; i < entries.length; i++) {
+                const e = entries[i];
+                if (e.isFolder || /^https?:\/\//i.test(e.title)) continue;
+                if (!byTitle[e.title]) byTitle[e.title] = [];
+                byTitle[e.title].push(e.id);
+              }
+              const dupIds = [];
+              for (const t in byTitle) {
+                if (!Object.prototype.hasOwnProperty.call(byTitle, t)) continue;
+                if (byTitle[t].length > 1) {
+                  for (let i = 1; i < byTitle[t].length; i++) dupIds.push(byTitle[t][i]);
+                }
+              }
+              if (dupIds.length > 0) {
+                const before = result.deleted_old;
+                await delBatch(dupIds);
+                result.deduped = result.deleted_old - before;
+              }
+            }
+          }
+        }
+
         if (result.errors.length > 20) result.errors = result.errors.slice(0, 20);
         return result;
       }
     });
 
-    harness.registerTool(ctx, tool);
+    // v19: try canonical tool name first; if an older (possibly broken) registration
+    // occupies it in the host process, fall back to wiki_to_ima2 so the tool stays usable.
+    try {
+      harness.registerTool(ctx, tool);
+    } catch (e) {
+      tool.name = 'wiki_to_ima2';
+      try {
+        harness.registerTool(ctx, tool);
+      } catch (e2) {
+        console.error('imakb: tool registration failed for both names: ' + (e2 && e2.message ? e2.message : String(e2)));
+      }
+    }
   }
 };
