@@ -32,8 +32,15 @@
 //         数小时后再跑一次 update(自带 fix_unparsed)收尾,工具幂等可重复调用;
 //         另注意同名去重必须跳过"空标题(解析中)"条目,否则整批空标题会被当成
 //         重复组误删(插件 loadKbEntries 天然跳过空标题,不受影响)。
+//  - v20.2: 新增 preserve_counter 参数(更新模式下 = true 时禁止一切追加重导:
+//         review_retry 与 fix_unparsed 均视为关闭,仅执行主导入一轮 + 校验 +
+//         删旧 + 同名去重)。背景:IMA 的知识库计数(knowledge_total_size /
+//         文件夹 file_number)是累计导入次数,删除不减、无回收站清除接口,唯一
+//         清零方式是删除整个知识库重建(CK3 2026-08-18 实测:计数 2057 vs
+//         实际条目 424 → 重建后计数 416);凡在意显示计数的场景,应让每个页面
+//         只被 import_urls 受理一次。
 
-// ========== Wiki → IMA 知识库导入通道 (imakb, v20: fix_unparsed + dedup_titles) ==========
+// ========== Wiki → IMA 知识库导入通道 (imakb, v20.2: preserve_counter + fix_unparsed + dedup_titles) ==========
 
 function parseUrl(raw) {
   if (typeof raw !== 'string') return null;
@@ -343,7 +350,7 @@ return {
   apply(ctx) {
     const tool = harness.defineTool({
       name: 'wiki_to_ima',
-      description: '把 Wiki 网站页面批量导入或更新到腾讯 IMA 知识库(经 IMA 服务端爬虫,可绕过本机 IP 被目标站点反爬限制的场景)。流程:发现页面(本机可访问时 BFS;被反爬拦截且提供 ima_token 时经 IMA 导入 allpages JSON 回读全站清单;也可直接传 urls 显式列表或 urls_file 文件列表)→ 分类页过滤 → 每批 10 个 URL 调 import_urls。知识库:传 kb_id 直接使用;或传 kb_name,自动按名字查找已有知识库,没有则自动创建(个人知识库)。文件夹:传 folder_name 自动创建(或复用同名)文件夹并把全部页面导入其中;传 folder_id 直接导入指定文件夹;不传则导入根目录。update=true 时进入更新模式(需 ima_uid/ima_token):对每个 URL 追加无害参数 ima_refresh 破 IMA 服务端 URL 缓存、真正重新抓取;轮询确认新条目在知识库中出现后才删除旧条目(旧条目识别兼容"已解析标题"与"未解析 URL 标题"两种形态,含同标题去重,按文件夹作用域;token 过期自动用 refresh_token 刷新),失败或校验超时则保留旧内容(kept),不丢数据。复查:导入结束后在 review_ms 窗口内轮询核对每个被受理页面的 media_id 是否真正出现在知识库中,缺失的自动换新 URL 参数重导一轮(review_retry),并报告 reviewed/missing。遇到 IMA 每日列表读取配额用尽(220021)时明确报告并跳过依赖列表的阶段(导入本身不受影响)。skip_builtin_filter=true 时关闭内置过滤(仅按 include/exclude 过滤),用于导入标题带扩展名等被误过滤的内容页。clear_kb=true 时在导入前清空目标范围(folder_id 或根目录,不含子文件夹)内的全部现有条目(需 ima_uid/ima_token,经 cgi del_knowledge 每批 10 个删除),实现整库/文件夹替换;单独传 clear_kb 而不传 url/urls/urls_file 时仅清空不导入。api_host 可选:页面发现(IMA 回读 allpages)时使用的 MediaWiki API 主机(如 m.prts.wiki),默认用起始 URL 主机,用于主域名被 WAF 拦截、API 挂在其他子域的站点。page_url_pattern 可选:由 allpages 标题构造页面 URL 的模板,{title} 被替换为分段编码后的标题(标题内 / 保留),默认 index.php?title={title};短链接站点如 prts.wiki 用 w/{title}。v20 起更新模式默认 fix_unparsed=true:复查结束后对"标题仍为原始 URL(未解析)"的条目自动换新参数重导,已解析副本出现后删除未解析条目(每页只保留一条,最多 fix_unparsed_rounds 轮);dedup_titles=true:最终删除同名已解析条目的多余副本,仅保留一条。参数:kb_id 与 kb_name 至少传一个(显式 urls 列表模式下 url 可省略);client_id、api_key 必填;folder_id/folder_name 可选;max_pages 默认 100;verify_ms 默认 300000;bust_cache 默认 true;review_ms 默认 180000(设 0 关闭复查);ima_uid/ima_token/ima_refresh_token 可选;include/exclude 为 URL 正则过滤。',
+      description: '把 Wiki 网站页面批量导入或更新到腾讯 IMA 知识库(经 IMA 服务端爬虫,可绕过本机 IP 被目标站点反爬限制的场景)。流程:发现页面(本机可访问时 BFS;被反爬拦截且提供 ima_token 时经 IMA 导入 allpages JSON 回读全站清单;也可直接传 urls 显式列表或 urls_file 文件列表)→ 分类页过滤 → 每批 10 个 URL 调 import_urls。知识库:传 kb_id 直接使用;或传 kb_name,自动按名字查找已有知识库,没有则自动创建(个人知识库)。文件夹:传 folder_name 自动创建(或复用同名)文件夹并把全部页面导入其中;传 folder_id 直接导入指定文件夹;不传则导入根目录。update=true 时进入更新模式(需 ima_uid/ima_token):对每个 URL 追加无害参数 ima_refresh 破 IMA 服务端 URL 缓存、真正重新抓取;轮询确认新条目在知识库中出现后才删除旧条目(旧条目识别兼容"已解析标题"与"未解析 URL 标题"两种形态,含同标题去重,按文件夹作用域;token 过期自动用 refresh_token 刷新),失败或校验超时则保留旧内容(kept),不丢数据。复查:导入结束后在 review_ms 窗口内轮询核对每个被受理页面的 media_id 是否真正出现在知识库中,缺失的自动换新 URL 参数重导一轮(review_retry),并报告 reviewed/missing。遇到 IMA 每日列表读取配额用尽(220021)时明确报告并跳过依赖列表的阶段(导入本身不受影响)。skip_builtin_filter=true 时关闭内置过滤(仅按 include/exclude 过滤),用于导入标题带扩展名等被误过滤的内容页。clear_kb=true 时在导入前清空目标范围(folder_id 或根目录,不含子文件夹)内的全部现有条目(需 ima_uid/ima_token,经 cgi del_knowledge 每批 10 个删除),实现整库/文件夹替换;单独传 clear_kb 而不传 url/urls/urls_file 时仅清空不导入。api_host 可选:页面发现(IMA 回读 allpages)时使用的 MediaWiki API 主机(如 m.prts.wiki),默认用起始 URL 主机,用于主域名被 WAF 拦截、API 挂在其他子域的站点。page_url_pattern 可选:由 allpages 标题构造页面 URL 的模板,{title} 被替换为分段编码后的标题(标题内 / 保留),默认 index.php?title={title};短链接站点如 prts.wiki 用 w/{title}。v20 起更新模式默认 fix_unparsed=true:复查结束后对"标题仍为原始 URL(未解析)"的条目自动换新参数重导,已解析副本出现后删除未解析条目(每页只保留一条,最多 fix_unparsed_rounds 轮);dedup_titles=true:最终删除同名已解析条目的多余副本,仅保留一条。v20.2 preserve_counter=true 时(更新模式)禁止一切追加重导:review_retry 与 fix_unparsed 均视为关闭,仅执行主导入一轮 + 校验 + 删旧 + 同名去重,适合在意知识库显示计数的场景(IMA 计数为累计导入次数,删除不减少,清零唯一方式是删除整个知识库重建)。参数:kb_id 与 kb_name 至少传一个(显式 urls 列表模式下 url 可省略);client_id、api_key 必填;folder_id/folder_name 可选;max_pages 默认 100;verify_ms 默认 300000;bust_cache 默认 true;review_ms 默认 180000(设 0 关闭复查);ima_uid/ima_token/ima_refresh_token 可选;include/exclude 为 URL 正则过滤。',
       parameters: {
         url: { type: 'string', description: 'Wiki 网站首页(或任意内容页)URL;提供了 urls 列表或 urls_file 时可省略' },
         urls: { type: 'array', items: { type: 'string' }, description: '可选:显式指定要导入/更新的 URL 列表(跳过自动发现)' },
@@ -372,7 +379,8 @@ return {
         ima_refresh_token: { type: 'string', description: 'IMA 刷新 token(浏览器 cookie 中的 IMA-REFRESH-TOKEN),token 过期时自动刷新' },
         fix_unparsed: { type: 'boolean', description: '更新模式下,复查结束后自动重导"标题仍为原始 URL(未解析)"的条目(换新缓存参数),等到已解析副本出现后删除未解析条目,最多 fix_unparsed_rounds 轮(默认 true);IMA 解析为小时级延迟,建议解析沉淀数小时后再跑一次 update 收尾(幂等)' },
         fix_unparsed_rounds: { type: 'integer', description: 'fix_unparsed 重导轮数上限(默认 2,范围 1-5)' },
-        dedup_titles: { type: 'boolean', description: '更新模式下,最终列出目标范围并删除同名(已解析)条目的多余副本,仅保留一条(默认 true)' }
+        dedup_titles: { type: 'boolean', description: '更新模式下,最终列出目标范围并删除同名(已解析)条目的多余副本,仅保留一条(默认 true)' },
+        preserve_counter: { type: 'boolean', description: '为 true 时(更新模式)禁止一切追加重导:review_retry 视为 false、fix_unparsed 视为 false,仅执行主导入一轮 + 校验 + 删旧 + 同名去重;用于在意知识库显示计数(IMA 计数为累计导入次数,只增不减)的场景' }
       },
       output: {
         schema: {
@@ -469,7 +477,9 @@ return {
         let reviewMs = args.review_ms === undefined ? 180000 : Number(args.review_ms);
         if (!Number.isFinite(reviewMs)) reviewMs = 180000;
         reviewMs = Math.max(0, Math.min(900000, Math.floor(reviewMs)));
-        const reviewRetry = args.review_retry !== false;
+        // v20.2: preserve_counter 禁止一切追加重导(复查补导/未解析修复),保住 IMA 累计计数
+        const preserveCounter = args.preserve_counter === true;
+        const reviewRetry = preserveCounter ? false : args.review_retry !== false;
         let includeRe = null;
         if (typeof args.include === 'string' && args.include.trim()) {
           try { includeRe = new RegExp(args.include, 'i'); } catch (e) { throw new Error('include 不是合法正则'); }
@@ -1034,7 +1044,7 @@ return {
         }
 
         // ===== v20: fix unparsed entries (URL-form titles) + dedup duplicate parsed titles =====
-        const doFixUnparsed = updateMode && args.fix_unparsed !== false;
+        const doFixUnparsed = updateMode && !preserveCounter && args.fix_unparsed !== false;
         const doDedup = updateMode && args.dedup_titles !== false;
         if (doFixUnparsed || doDedup) {
           let fixRounds = args.fix_unparsed_rounds === undefined ? 2 : Number(args.fix_unparsed_rounds);
